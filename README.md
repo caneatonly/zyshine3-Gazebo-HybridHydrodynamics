@@ -1,4 +1,59 @@
 # HybridHydrodynamics 插件说明
+A Gazebo system plugin for implementing hydrodynamic effects on an air-water hybrid vehicle, developed based on Gazebo’s official Hydrodynamics plugin. 
+
+## 依赖与版本
+
+-  Ubuntu 22.04.4 LTS
+- CMake `>= 3.10`
+- GCC / Clang，支持 `C++17`
+- `Gazebo Harmonic` 开发包
+
+## Startup
+
+### 1. Clone 仓库
+
+```bash
+git clone https://github.com/caneatonly/zyshine3-Gazebo-HybridHydrodynamics.git
+cd zyshine3-Gazebo-HybridHydrodynamics
+```
+
+### 2. 配置并编译插件
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
+
+编译成功后，插件库通常位于：
+
+```bash
+build/libhydrodynamics.so
+```
+
+### 3. 让 Gazebo 能找到这个插件
+
+运行仿真前，把插件目录加入 `GZ_SIM_SYSTEM_PLUGIN_PATH`：
+
+```bash
+export GZ_SIM_SYSTEM_PLUGIN_PATH=$(pwd)/build:${GZ_SIM_SYSTEM_PLUGIN_PATH}
+```
+
+### 4. 在模型或 world 的 SDF 中加载插件
+
+示例：
+
+```xml
+<plugin filename="libhydrodynamics" name="zyshine3_gz_plugins::HybridHydrodynamics">
+  <hydrodynamics>
+    <link_name>base_link</link_name>
+    <surface_z>0.0</surface_z>
+    <transition_band>0.1</transition_band>
+    <fluid_density_water>1000.0</fluid_density_water>
+    <fluid_density_air>1.225</fluid_density_air>
+    <sample_point>0 0 0</sample_point>
+  </hydrodynamics>
+</plugin>
+```
 
 ## 插件功能
 
