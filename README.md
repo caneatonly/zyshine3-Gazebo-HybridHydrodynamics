@@ -1,212 +1,344 @@
-# HybridHydrodynamics 插件说明
-A Gazebo system plugin for implementing hydrodynamic effects on an air-water hybrid vehicle, developed based on Gazebo’s official Hydrodynamics plugin. 
+# HybridHydrodynamics v2 说明
 
-## 依赖与版本
+`HybridHydrodynamics` 是一个面向水空跨域平台的 Gazebo System 插件。
+它以 Gazebo 官方 hydrodynamics 的取速路径和 `PreUpdate` 生命周期为骨架，在其上增加了：
 
--  Ubuntu 22.04.4 LTS
-- CMake `>= 3.10`
-- GCC / Clang，支持 `C++17`
-- `Gazebo Harmonic` 开发包
+- 水空跨域浸没比例计算
+- 连续介质缩放 `mediumScale`
+- 插件侧对角附加质量 `-M_A \hat{\dot{\nu}}_r`
+- 主对角近似的附加质量科氏项 `-C_A(\nu_r)\nu_r`
+- `/model/<name>/transition_state` 诊断发布
 
-## Startup
+当前版本只维护 `external/plugins/hydrodynamics` 这份外部插件实现。
 
-### 1. Clone 仓库
+## 1. 当前动力学形式
 
-```bash
-git clone https://github.com/caneatonly/zyshine3-Gazebo-HybridHydrodynamics.git
-cd zyshine3-Gazebo-HybridHydrodynamics
-```
+本插件当前施加的水动力写成：
 
-### 2. 配置并编译插件
+$$
+\tau_H =
+s(h,\rho_{eff})
+\left(
+-M_A \hat{\dot{\nu}}_r
+-C_A(\nu_r)\nu_r
+-D(\nu_r)\nu_r
+\right)
+$$
 
-```bash
-cmake -S . -B build
-cmake --build build -j
-```
+其中：
 
-编译成功后，插件库通常位于：
+- $\nu_r = [u_r, v_r, w_r, p, q, r]^T$：机体系相对流体速度
+- $M_A$：仅保留主对角项的附加质量矩阵
+- $C_A(\nu_r)\nu_r$：由主对角附加质量导出的简化科氏/离心项
+- $D(\nu_r)\nu_r$：阻尼项
+- $s(h,\rho_{eff})$：由浸没比例与等效密度计算出的连续缩放
 
-```bash
-build/libhydrodynamics.so
-```
+这里的 $\hat{\dot{\nu}}_r$ 不是直接差分速度，而是经过滤波、加速度限幅和 jerk 限制后的估计值。
 
-### 3. 让 Gazebo 能找到这个插件
+## 2. 为什么这样实现
 
-运行仿真前，把插件目录加入 `GZ_SIM_SYSTEM_PLUGIN_PATH`：
+直接用速度差分构造插件侧 `-M_A \dot{\nu}_r` 很容易在以下场景引入尖峰：
 
-```bash
-export GZ_SIM_SYSTEM_PLUGIN_PATH=$(pwd)/build:${GZ_SIM_SYSTEM_PLUGIN_PATH}
-```
+- 模型刚刚 spawn
+- pause / resume
+- 水面穿越
+- 接触求解脉冲
+- 数值噪声导致的高频速度跳变
 
-### 4. 在模型或 world 的 SDF 中加载插件
+因此当前版本采用“工程近似的稳化估计器”：
 
-示例：
+1. 先对相对速度做一阶低通
+2. 再差分得到原始加速度
+3. 对原始加速度再做一阶低通
+4. 分别对线加速度和角加速度做幅值限制
+5. 再分别做 jerk 限制
+6. 在空气段、缩放很小、首次有效步、pause/resume 后第一拍等条件下复位估计器
+
+这不是严格的变浸没附加质量动量模型，但能在跨域仿真里提供更稳定、可调的附加质量近似。
+
+## 3. 速度与加速度估计
+
+插件沿用官方 Gazebo hydrodynamics 的速度获取路径：
+
+- `WorldLinearVelocity`
+- `WorldAngularVelocity`
+- `WorldPose`
+
+处理流程为：
+
+1. 世界系线速度减去 `default_current`
+2. 用姿态旋转到机体系
+3. 构造
+
+$$
+\nu_r = [u_r, v_r, w_r, p, q, r]^T
+$$
+
+附加质量项里的加速度估计为：
+
+$$
+\nu_f(k) = \mathrm{LPF}(\nu_r(k))
+$$
+
+$$
+\dot{\nu}_{raw}(k) = \frac{\nu_f(k)-\nu_f(k-1)}{\Delta t}
+$$
+
+$$
+\dot{\nu}_f(k) = \mathrm{LPF}(\dot{\nu}_{raw}(k))
+$$
+
+$$
+\hat{\dot{\nu}}_r(k) =
+\mathrm{JerkLimit}
+\left(
+\mathrm{AccelClip}(\dot{\nu}_f(k))
+\right)
+$$
+
+最终使用：
+
+$$
+\tau_A = -M_A \hat{\dot{\nu}}_r
+$$
+
+## 4. 主对角附加质量与 `C_A(\nu_r)\nu_r`
+
+### 4.1 参数约定
+
+SDF 中仍沿用传统导数写法：
 
 ```xml
-<plugin filename="libhydrodynamics" name="zyshine3_gz_plugins::HybridHydrodynamics">
+<xDotU>-2.4</xDotU>
+<yDotV>-5.2</yDotV>
+<zDotW>-2.1</zDotW>
+<kDotP>-0.08</kDotP>
+<mDotQ>-0.24</mDotQ>
+<nDotR>-0.32</nDotR>
+```
+
+插件内部按正幅值使用：
+
+$$
+a_1 = -xDotU,\quad a_2 = -yDotV,\quad a_3 = -zDotW
+$$
+
+$$
+b_1 = -kDotP,\quad b_2 = -mDotQ,\quad b_3 = -nDotR
+$$
+
+并构造：
+
+$$
+A_{11}=\mathrm{diag}(a_1,a_2,a_3),\qquad
+A_{22}=\mathrm{diag}(b_1,b_2,b_3)
+$$
+
+### 4.2 简化 `C_A(\nu_r)\nu_r`
+
+把 6 维速度拆成：
+
+$$
+\nu_1 = [u_r,v_r,w_r]^T,\qquad
+\nu_2 = [p,q,r]^T
+$$
+
+当前实现采用主对角近似：
+
+$$
+C_A(\nu_r)\nu_r =
+\begin{bmatrix}
+-S(A_{11}\nu_1)\nu_2 \\
+-S(A_{11}\nu_1)\nu_1 - S(A_{22}\nu_2)\nu_2
+\end{bmatrix}
+$$
+
+其中叉乘矩阵满足：
+
+$$
+S(x)y = x \times y
+$$
+
+也就是说，当前实现里：
+
+- 平动力部分：`-Cross(A11 * nu1, nu2)`
+- 力矩部分：`-Cross(A11 * nu1, nu1) - Cross(A22 * nu2, nu2)`
+
+这部分不依赖加速度差分，通常比裸的插件侧 `-M_A \dot{\nu}_r` 更稳定。
+
+## 5. 阻尼项
+
+阻尼仍保持当前的“线性项 + abs 二次项”形式：
+
+$$
+\tau_D = -D(\nu_r)\nu_r
+$$
+
+当前只保留：
+
+- 线性项：`xU`, `yV`, `zW`, `kP`, `mQ`, `nR`
+- `abs` 二次项：`xUabsU`, `yVabsV`, `zWabsW`, `kPabsP`, `mQabsQ`, `nRabsR`
+
+不再使用 `xUU` 这类非 `abs` 二次项。
+
+## 6. 水空跨域缩放
+
+插件通过多个 `sample_point` 估计机体浸没比例 `h`，再结合空气/水密度计算：
+
+$$
+\rho_{eff} = \rho_{air} + h(\rho_{water}-\rho_{air})
+$$
+
+$$
+s(h,\rho_{eff}) =
+\mathrm{clamp}
+\left(
+h \cdot \frac{\rho_{eff}}{\rho_{water}},
+0, 1
+\right)
+$$
+
+当前 `-M_A \hat{\dot{\nu}}_r`、`-C_A(\nu_r)\nu_r` 和阻尼项都乘同一个 `mediumScale`。
+
+这是一种跨域工程近似。当前版本没有显式建模：
+
+$$
+\frac{d}{dt}(M_A(\lambda)\nu_r)
+$$
+
+里与 `\dot{\lambda}` 相关的附加项。
+
+## 7. 与 `<fluid_added_mass>` 的关系
+
+当前版本由**插件侧附加质量主导**。
+
+因此：
+
+- `teleh4z/model.sdf` 中的 `<fluid_added_mass>` 必须继续保持注释
+- 如果 link 上检测到非零 `<fluid_added_mass>`，插件会发出高优先级警告
+- 为避免双重计算，插件会安全回退为“只保留阻尼与诊断”的模式
+
+换句话说，下面两种路径只能选一种：
+
+1. 物理引擎 `<fluid_added_mass>`
+2. 插件侧 `-M_A \hat{\dot{\nu}}_r + C_A(\nu_r)\nu_r`
+
+当前 v2 选择的是第 2 种。
+
+## 8. 估计器复位条件
+
+插件会在以下情况下复位附加质量估计器，并在该拍不施加插件侧 added mass / `C_A`：
+
+- `dt <= 0`
+- `dt` 明显异常
+- `mediumScale < added_mass_reset_scale_threshold`
+- 第一次进入有效步
+- pause / resume 后第一拍
+
+这么做是为了避免：
+
+- 刚入水瞬间的伪尖峰
+- 刚 spawn 或 pause/resume 带来的虚假差分加速度
+
+## 9. 主要 SDF 参数
+
+### 9.1 基础参数
+
+- `link_name`
+- `surface_z`
+- `transition_band`
+- `fluid_density_water`
+- `fluid_density_air`
+- `default_current`
+- `air_clearance_margin`
+- `sample_point`
+- `water_thruster_link_name`
+- `air_prop_link_name`
+
+### 9.2 附加质量与科氏项
+
+- `enable_added_mass`
+- `enable_added_mass_coriolis`
+- `xDotU`
+- `yDotV`
+- `zDotW`
+- `kDotP`
+- `mDotQ`
+- `nDotR`
+
+### 9.3 稳化估计器参数
+
+- `added_mass_velocity_filter_tau`
+- `added_mass_accel_filter_tau`
+- `added_mass_linear_accel_limit`
+- `added_mass_angular_accel_limit`
+- `added_mass_linear_jerk_limit`
+- `added_mass_angular_jerk_limit`
+- `added_mass_reset_scale_threshold`
+
+## 10. teleh4z 当前示例
+
+```xml
+<plugin filename="/home/user/external/plugins/hydrodynamics/build/libhydrodynamics.so"
+        name="zyshine3_gz_plugins::HybridHydrodynamics">
   <hydrodynamics>
     <link_name>base_link</link_name>
     <surface_z>0.0</surface_z>
     <transition_band>0.1</transition_band>
     <fluid_density_water>1000.0</fluid_density_water>
     <fluid_density_air>1.225</fluid_density_air>
-    <sample_point>0 0 0</sample_point>
+    <default_current>0 0 0</default_current>
+
+    <enable_added_mass>true</enable_added_mass>
+    <enable_added_mass_coriolis>true</enable_added_mass_coriolis>
+    <xDotU>-2.4</xDotU>
+    <yDotV>-5.2</yDotV>
+    <zDotW>-2.1</zDotW>
+    <kDotP>-0.08</kDotP>
+    <mDotQ>-0.24</mDotQ>
+    <nDotR>-0.32</nDotR>
+
+    <added_mass_velocity_filter_tau>0.03</added_mass_velocity_filter_tau>
+    <added_mass_accel_filter_tau>0.06</added_mass_accel_filter_tau>
+    <added_mass_linear_accel_limit>4.0</added_mass_linear_accel_limit>
+    <added_mass_angular_accel_limit>8.0</added_mass_angular_accel_limit>
+    <added_mass_linear_jerk_limit>20.0</added_mass_linear_jerk_limit>
+    <added_mass_angular_jerk_limit>40.0</added_mass_angular_jerk_limit>
+    <added_mass_reset_scale_threshold>0.05</added_mass_reset_scale_threshold>
+
+    <xU>-8.0</xU>
+    <xUabsU>-15.0</xUabsU>
+    <yV>-18.0</yV>
+    <yVabsV>-65.0</yVabsV>
+    <zW>-12.0</zW>
+    <zWabsW>-42.0</zWabsW>
+    <kP>-1.2</kP>
+    <kPabsP>-1.5</kPabsP>
+    <mQ>-4.0</mQ>
+    <mQabsQ>-9.0</mQabsQ>
+    <nR>-4.5</nR>
+    <nRabsR>-10.5</nRabsR>
   </hydrodynamics>
 </plugin>
 ```
 
-## 插件功能
+## 11. 已知局限
 
-`HybridHydrodynamics` 是一个面向水空跨域飞行器的 Gazebo 系统插件。
-当前主要实现的功能是：
-- 基于官方 Gazebo hydrodynamics 的生命周期与取速路径实现阻尼项
-- 计算相对水流速度
-- 计算机体、涉水推进器、空气桨的跨介质诊断量
-- 在水面附近对阻尼进行连续缩放，即通过计算机体入水比例来动态调整水阻尼的影响
-- 发布 `/model/<name>/transition_state` 用于发布当前机体的浸水程度
+- 这是跨域工程近似，不是严格的变质量流体动量求解
+- `mediumScale` 对附加质量项和 `C_A` 的连续缩放在物理上只是近似
+- 参数需要结合机体质量、浮力裕度、推进器动态和仿真步长调参
+- 若 heave 通道的 `zDotW` 过大，或滤波/限幅过松，可能出现“上浮被压制”这类非理想现象
 
-它当前不负责：
-- 插件内部附加质量
-- 插件内部附加质量科氏项
+## 12. 编译
 
-其中浮力由世界级 `Buoyancy` 系统负责，推进器推力由独立的推进器插件负责，
-附加质量由模型的 `<link><inertial><fluid_added_mass>` 交给 Gazebo 物理引擎求解。
+```bash
+cd /home/user/external/plugins/hydrodynamics
+cmake -S . -B build
+cmake --build build -j
+```
 
-## 基于 Fossen 方程的公式推导
+生成库文件：
 
-### 完整 Fossen 水动力形式
-
-Fossen 常见的 6 自由度水动力写法可记为：
-
-$$
-\tau_H = -M_A \dot{\nu}_r - C_A(\nu_r)\nu_r - D(\nu_r)\nu_r - g(\eta)
-$$
-
-其中：
-
-- $\nu_r = [u_r, v_r, w_r, p, q, r]^T$ 是相对流体的机体系速度
-- $M_A$ 是附加质量矩阵
-- $C_A(\nu_r)$ 是附加质量对应的科氏与离心项
-- $D(\nu_r)$ 是阻尼矩阵
-- $g(\eta)$ 是恢复力项
-
-对于当前插件，我们主动只保留阻尼项，把模型简化为：
-
-$$
-\tau_H = -D(\nu_r)\nu_r
-$$
-
-再结合跨水空介质的连续缩放，最终施加的水动力为：
-
-$$
-\tau_H^{applied} = s(h,\rho_{eff}) \left(-D(\nu_r)\nu_r\right)
-$$
-
-其中：
-
-- $h$ 是机体浸没比例
-- $\rho_{eff}$ 是水面附近的等效介质密度
-- $s(h,\rho_{eff})$ 是连续缩放因子
-
-### 只保留阻尼项的原因
-
-这次设计有两个核心考虑：
-
-1. `added mass` 已经通过 `<fluid_added_mass>` 交给 Gazebo 物理引擎求解，插件里再手工施加
-   $-M_A \dot{\nu}_r$ 和对应科氏项会产生重复计算。
-2. 原本通过速度差分显式构造加速度，再外加 `-M_A \dot{\nu}_r`，数值上容易形成显式反馈，
-   在水面过渡、接触和高频步长下更容易触发发散或 ODE 崩溃。
-
-## 当前实现流程
-
-### 生命周期
-
-插件沿用官方 Gazebo hydrodynamics 的骨架：
-
-- `Configure`
-- `PreUpdate`
-
-### 速度获取路径
-沿用官方取速方式：
-
-- `WorldLinearVelocity`
-- `WorldAngularVelocity`
-- `WorldPose`
-
-线速度先在世界系减去 `default_current`，得到相对水流的世界系速度；
-再通过姿态旋转到机体系，得到：
-
-$$
-\nu_r = [u_r, v_r, w_r, p, q, r]^T
-$$
-
-### 浸没比例与连续缩放
-
-插件通过多个 `sample_point` 计算机体浸没比例 `h`。
-单点浸没函数采用水面附近线性过渡：
-
-$$
-\lambda(z)=
-\begin{cases}
-1, & z \le z_s-\frac{b}{2} \\
-0, & z \ge z_s+\frac{b}{2} \\
-\dfrac{z_s+\frac{b}{2}-z}{b}, & \text{otherwise}
-\end{cases}
-$$
-
-其中：
-- $z_s$ 对应 `surface_z`
-- $b$ 对应 `transition_band`
-
-机体浸没比例为各采样点平均值：
-
-$$
-h=\frac{1}{N}\sum_{i=1}^{N}\lambda(z_i)
-$$
-
-随后按空气密度与水密度插值得到等效密度：
-
-$$
-\rho_{eff} = \rho_{air} + h(\rho_{water}-\rho_{air})
-$$
-
-再计算连续缩放：
-
-$$
-s(h,\rho_{eff}) =
-\mathrm{clamp}\left(
-h \cdot \frac{\rho_{eff}}{\rho_{water}},
-0, 1
-\right)
-$$
-
-这个缩放只作用在阻尼项上，不作用于任何惯性项。
-
-## 参数说明
-
-### 插件有效参数
-
-- `link_name`：确定水阻尼作用在哪一个Link上
-- `surface_z`：确定水面高度，与world.sdf对齐
-- `transition_band`：定义水空交界过渡区间，实现水空转换时的线性过渡
-- `fluid_density_water` ：水密度
-- `fluid_density_air`：空气密度
-- `default_current`：洋流
-- `air_clearance_margin`：用于确定空桨是否出水
-- `sample_point`：采样点，用于计算浸沒比例
-- `water_thruster_link_name`：水桨推进器名称
-- `air_prop_link_name`：空桨推进器名称
-
-阻尼参数仅保留两类：
-
-- 线性项：`xU`, `yV`, `zW`, `kP`, `mQ`, `nR`
-- `abs` 二次项：`xUabsU`, `yVabsV`, `zWabsW`, `kPabsP`, `mQabsQ`, `nRabsR`
-
-## 附加质量策略
-
-当前采用 `engine-first` 策略：
-
-- 如果 link 上定义了非零 `<fluid_added_mass>`，则附加质量由 Gazebo physics 负责。
-- 插件内部不再计算 `-M_A \dot{\nu}_r`。
-- 插件内部不再计算附加质量科氏项。
-- 如果没有定义非零 `<fluid_added_mass>`，插件退化为纯阻尼模式，并输出警告。
+```bash
+/home/user/external/plugins/hydrodynamics/build/libhydrodynamics.so
+```

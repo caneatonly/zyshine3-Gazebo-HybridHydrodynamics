@@ -60,6 +60,7 @@ class HydrodynamicsPlugin : public gz::sim::System,
   std::vector<gz::sim::Link> water_thruster_links_;
   std::vector<gz::sim::Link> air_prop_links_;
 
+  std::array<double, 6> added_mass_diagonal_{};
   std::array<double, 36> stability_linear_terms_{};
   std::array<double, 216> stability_quadratic_abs_derivatives_{};
 
@@ -71,11 +72,29 @@ class HydrodynamicsPlugin : public gz::sim::System,
   double fluid_density_air_{1.225};
   double air_clearance_margin_{0.05};
 
+  bool enable_added_mass_{false};
+  bool enable_added_mass_coriolis_{false};
+  double added_mass_velocity_filter_tau_{0.03};
+  double added_mass_accel_filter_tau_{0.06};
+  double added_mass_linear_accel_limit_{4.0};
+  double added_mass_angular_accel_limit_{8.0};
+  double added_mass_linear_jerk_limit_{20.0};
+  double added_mass_angular_jerk_limit_{40.0};
+  double added_mass_reset_scale_threshold_{0.05};
+
+  std::array<double, 6> filtered_relative_velocity_{};
+  std::array<double, 6> filtered_relative_acceleration_{};
+  std::array<double, 6> limited_relative_acceleration_{};
+  bool added_mass_estimator_initialized_{false};
+  bool reset_added_mass_estimator_{true};
+
   bool engine_owns_added_mass_{false};
 
   gz::transport::Node node_;
   gz::transport::Node::Publisher transition_publisher_;
   std::string transition_topic_;
+
+  void ResetAddedMassEstimator(const std::array<double, 6> &_state);
 };
 
 }  // namespace hydrodynamics

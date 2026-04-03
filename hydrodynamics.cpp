@@ -24,6 +24,8 @@ namespace {
 
 constexpr std::size_t kStateSize = 6u;
 constexpr double kAddedMassEpsilon = 1e-6;
+constexpr double kReasonableTauEpsilon = 1e-9;
+constexpr double kMaxReasonableDtSeconds = 0.1;
 
 using Vec6 = std::array<double, kStateSize>;
 using Mat6 = std::array<double, kStateSize * kStateSize>;
@@ -90,6 +92,81 @@ bool HasNonZeroFluidAddedMass(const gz::math::Matrix6d &_matrix) {
   return false;
 }
 
+bool HasNonZeroAddedMassDiagonal(const Vec6 &_diagonal) {
+  for (const auto value : _diagonal) {
+    if (std::abs(value) > kAddedMassEpsilon) {
+      return true;
+    }
+  }
+  return false;
+}
+
+double FirstOrderLpfSample(const double _input, const double _previous,
+                           const double _dtSeconds, const double _tauSeconds) {
+  if (_dtSeconds <= 0.0 || _tauSeconds <= kReasonableTauEpsilon) {
+    return _input;
+  }
+
+  const double alpha = _dtSeconds / (_tauSeconds + _dtSeconds);
+  return _previous + alpha * (_input - _previous);
+}
+
+Vec6 FirstOrderLpf(const Vec6 &_input, const Vec6 &_previous,
+                   const double _dtSeconds, const double _tauSeconds) {
+  Vec6 result{};
+  for (std::size_t i = 0; i < kStateSize; ++i) {
+    result[i] =
+        FirstOrderLpfSample(_input[i], _previous[i], _dtSeconds, _tauSeconds);
+  }
+  return result;
+}
+
+Vec6 LimitAccelerationAmplitude(const Vec6 &_input,
+                                const double _linearLimit,
+                                const double _angularLimit) {
+  Vec6 result = _input;
+  for (std::size_t i = 0; i < kStateSize; ++i) {
+    const double limit = i < 3u ? _linearLimit : _angularLimit;
+    if (limit <= 0.0) {
+      continue;
+    }
+
+    result[i] = std::clamp(result[i], -limit, limit);
+  }
+  return result;
+}
+
+Vec6 LimitAccelerationJerk(const Vec6 &_input, const Vec6 &_previous,
+                           const double _dtSeconds,
+                           const double _linearJerkLimit,
+                           const double _angularJerkLimit) {
+  if (_dtSeconds <= 0.0) {
+    return _input;
+  }
+
+  Vec6 result = _input;
+  for (std::size_t i = 0; i < kStateSize; ++i) {
+    const double jerkLimit = i < 3u ? _linearJerkLimit : _angularJerkLimit;
+    if (jerkLimit <= 0.0) {
+      continue;
+    }
+
+    const double maxDelta = jerkLimit * _dtSeconds;
+    const double delta =
+        std::clamp(_input[i] - _previous[i], -maxDelta, maxDelta);
+    result[i] = _previous[i] + delta;
+  }
+  return result;
+}
+
+gz::math::Vector3d Cross(const gz::math::Vector3d &_left,
+                         const gz::math::Vector3d &_right) {
+  return gz::math::Vector3d(
+      _left.Y() * _right.Z() - _left.Z() * _right.Y(),
+      _left.Z() * _right.X() - _left.X() * _right.Z(),
+      _left.X() * _right.Y() - _left.Y() * _right.X());
+}
+
 std::string LinkNameOrEntity(const gz::sim::Link &_link,
                              const gz::sim::EntityComponentManager &_ecm) {
   const auto linkName = _link.Name(_ecm);
@@ -142,7 +219,12 @@ void HydrodynamicsPlugin::Configure(
 
 void HydrodynamicsPlugin::PreUpdate(const gz::sim::UpdateInfo &_info,
                                     gz::sim::EntityComponentManager &_ecm) {
-  if (_info.paused || !this->link_.Valid(_ecm)) {
+  if (_info.paused) {
+    this->reset_added_mass_estimator_ = true;
+    return;
+  }
+
+  if (!this->link_.Valid(_ecm)) {
     return;
   }
 
@@ -175,7 +257,13 @@ void HydrodynamicsPlugin::ParseHydrodynamics(
     const gz::sim::EntityComponentManager &_ecm) {
   this->stability_linear_terms_.fill(0.0);
   this->stability_quadratic_abs_derivatives_.fill(0.0);
+  this->added_mass_diagonal_.fill(0.0);
   this->engine_owns_added_mass_ = false;
+  this->added_mass_estimator_initialized_ = false;
+  this->reset_added_mass_estimator_ = true;
+  this->filtered_relative_velocity_.fill(0.0);
+  this->filtered_relative_acceleration_.fill(0.0);
+  this->limited_relative_acceleration_.fill(0.0);
 
   std::string linkName;
   if (_element->HasElement("link_name")) {
@@ -207,6 +295,58 @@ void HydrodynamicsPlugin::ParseHydrodynamics(
       _element
           ->Get<gz::math::Vector3d>("default_current", this->default_current_)
           .first;
+
+  this->enable_added_mass_ =
+      _element->Get<bool>("enable_added_mass", this->enable_added_mass_).first;
+  this->enable_added_mass_coriolis_ =
+      _element
+          ->Get<bool>("enable_added_mass_coriolis",
+                      this->enable_added_mass_coriolis_)
+          .first;
+  this->added_mass_velocity_filter_tau_ =
+      _element
+          ->Get<double>("added_mass_velocity_filter_tau",
+                        this->added_mass_velocity_filter_tau_)
+          .first;
+  this->added_mass_accel_filter_tau_ =
+      _element
+          ->Get<double>("added_mass_accel_filter_tau",
+                        this->added_mass_accel_filter_tau_)
+          .first;
+  this->added_mass_linear_accel_limit_ =
+      _element
+          ->Get<double>("added_mass_linear_accel_limit",
+                        this->added_mass_linear_accel_limit_)
+          .first;
+  this->added_mass_angular_accel_limit_ =
+      _element
+          ->Get<double>("added_mass_angular_accel_limit",
+                        this->added_mass_angular_accel_limit_)
+          .first;
+  this->added_mass_linear_jerk_limit_ =
+      _element
+          ->Get<double>("added_mass_linear_jerk_limit",
+                        this->added_mass_linear_jerk_limit_)
+          .first;
+  this->added_mass_angular_jerk_limit_ =
+      _element
+          ->Get<double>("added_mass_angular_jerk_limit",
+                        this->added_mass_angular_jerk_limit_)
+          .first;
+  this->added_mass_reset_scale_threshold_ =
+      _element
+          ->Get<double>("added_mass_reset_scale_threshold",
+                        this->added_mass_reset_scale_threshold_)
+          .first;
+
+  const std::array<std::string, kStateSize> addedMassFields = {
+      "xDotU", "yDotV", "zDotW", "kDotP", "mDotQ", "nDotR"};
+  for (std::size_t i = 0; i < kStateSize; ++i) {
+    if (_element->HasElement(addedMassFields[i])) {
+      this->added_mass_diagonal_[i] =
+          std::abs(_element->Get<double>(addedMassFields[i]));
+    }
+  }
 
   this->WarnOnDeprecatedParameters(_element);
 
@@ -295,22 +435,44 @@ void HydrodynamicsPlugin::DetectAddedMassOwnership(
   const bool hasLocalFluidAddedMass =
       inertial != nullptr && inertial->Data().FluidAddedMass().has_value() &&
       HasNonZeroFluidAddedMass(inertial->Data().FluidAddedMass().value());
+  const bool pluginAddedMassConfigured =
+      HasNonZeroAddedMassDiagonal(this->added_mass_diagonal_) &&
+      (this->enable_added_mass_ || this->enable_added_mass_coriolis_);
 
   if (hasWorldFluidAddedMass || hasLocalFluidAddedMass) {
     this->engine_owns_added_mass_ = true;
-    gzmsg << "[HybridHydrodynamics] Detected <fluid_added_mass> on link ["
-          << linkName
-          << "]. Added-mass inertia is owned by Gazebo physics; the plugin "
-             "will only apply damping and hybrid-medium scaling."
-          << std::endl;
+    if (pluginAddedMassConfigured) {
+      gzwarn << "[HybridHydrodynamics] Detected non-zero <fluid_added_mass> "
+                "on link ["
+             << linkName
+             << "]. This would double-count added mass, so plugin-side "
+                "-M_A * nu_dot_r and C_A(nu_r)nu_r are disabled. Only "
+                "damping and transition diagnostics remain active."
+             << std::endl;
+    } else {
+      gzmsg << "[HybridHydrodynamics] Detected non-zero <fluid_added_mass> "
+               "on link ["
+            << linkName
+            << "]. Plugin-side added mass remains disabled to avoid double "
+               "counting."
+            << std::endl;
+    }
     return;
   }
 
   this->engine_owns_added_mass_ = false;
-  gzwarn << "[HybridHydrodynamics] No non-zero <fluid_added_mass> found on "
-            "link ["
-         << linkName
-         << "]. Running damping-only hybrid hydrodynamics." << std::endl;
+  if (pluginAddedMassConfigured) {
+    gzmsg << "[HybridHydrodynamics] Plugin-side added mass is active on link ["
+          << linkName << "] with inertia_term="
+          << (this->enable_added_mass_ ? "on" : "off")
+          << ", coriolis_term="
+          << (this->enable_added_mass_coriolis_ ? "on" : "off") << "."
+          << std::endl;
+  } else {
+    gzmsg << "[HybridHydrodynamics] Running damping-only hybrid "
+             "hydrodynamics on link ["
+          << linkName << "]." << std::endl;
+  }
 }
 
 void HydrodynamicsPlugin::WarnOnDeprecatedParameters(
@@ -318,21 +480,7 @@ void HydrodynamicsPlugin::WarnOnDeprecatedParameters(
   const std::string snameConventionVel = "UVWPQR";
   const std::string snameConventionMoment = "xyzkmn";
 
-  bool hasDeprecatedAddedMass = false;
   bool hasDeprecatedQuadratic = false;
-  for (std::size_t i = 0; i < kStateSize && !hasDeprecatedAddedMass; ++i) {
-    for (std::size_t j = 0; j < kStateSize; ++j) {
-      std::string field;
-      field += snameConventionMoment[i];
-      field += "Dot";
-      field += snameConventionVel[j];
-      if (_element->HasElement(field)) {
-        hasDeprecatedAddedMass = true;
-        break;
-      }
-    }
-  }
-
   for (std::size_t i = 0; i < kStateSize && !hasDeprecatedQuadratic; ++i) {
     for (std::size_t j = 0; j < kStateSize && !hasDeprecatedQuadratic; ++j) {
       std::string prefix;
@@ -349,14 +497,6 @@ void HydrodynamicsPlugin::WarnOnDeprecatedParameters(
     }
   }
 
-  if (hasDeprecatedAddedMass) {
-    gzwarn << "[HybridHydrodynamics] Plugin-side added-mass parameters "
-              "(<xDotU> ... <nDotR>) are deprecated and ignored. Define "
-              "diagonal added mass in <link><inertial><fluid_added_mass> "
-              "instead."
-           << std::endl;
-  }
-
   if (hasDeprecatedQuadratic) {
     gzwarn << "[HybridHydrodynamics] Non-abs quadratic damping parameters "
               "(such as <xUU>) are deprecated and ignored. Keep only "
@@ -367,15 +507,15 @@ void HydrodynamicsPlugin::WarnOnDeprecatedParameters(
   if (_element->HasElement("disable_added_mass") ||
       _element->HasElement("disable_coriolis")) {
     gzwarn << "[HybridHydrodynamics] <disable_added_mass> and "
-              "<disable_coriolis> are deprecated and ignored because the "
-              "plugin no longer computes added mass or added-mass Coriolis "
-              "terms."
+              "<disable_coriolis> are deprecated and ignored. Use "
+              "<enable_added_mass> and <enable_added_mass_coriolis> "
+              "instead."
            << std::endl;
   }
 }
 
 void HydrodynamicsPlugin::UpdateForcesAndMoments(
-    const gz::sim::UpdateInfo &,
+    const gz::sim::UpdateInfo &_info,
     gz::sim::EntityComponentManager &_ecm) {
   const auto pose = this->link_.WorldPose(_ecm);
   auto worldLinear =
@@ -426,6 +566,7 @@ void HydrodynamicsPlugin::UpdateForcesAndMoments(
       std::clamp(hullRatio * densityScale, 0.0, 1.0);
 
   if (mediumScale < 1e-5) {
+    this->reset_added_mass_estimator_ = true;
     return;
   }
 
@@ -441,12 +582,84 @@ void HydrodynamicsPlugin::UpdateForcesAndMoments(
     }
   }
 
-  const auto totalWrench = MatVecMul(dampingMatrix, state);
+  const auto dampingWrench = MatVecMul(dampingMatrix, state);
 
-  gz::math::Vector3d totalForce(-totalWrench[0], -totalWrench[1],
-                                -totalWrench[2]);
-  gz::math::Vector3d totalTorque(-totalWrench[3], -totalWrench[4],
-                                 -totalWrench[5]);
+  gz::math::Vector3d totalForce(-dampingWrench[0], -dampingWrench[1],
+                                -dampingWrench[2]);
+  gz::math::Vector3d totalTorque(-dampingWrench[3], -dampingWrench[4],
+                                 -dampingWrench[5]);
+
+  const bool pluginAddedMassEnabled =
+      !this->engine_owns_added_mass_ &&
+      HasNonZeroAddedMassDiagonal(this->added_mass_diagonal_) &&
+      (this->enable_added_mass_ || this->enable_added_mass_coriolis_);
+
+  if (pluginAddedMassEnabled) {
+    const double dtSeconds =
+        static_cast<double>(_info.dt.count()) / 1'000'000'000.0;
+    const bool invalidDt =
+        dtSeconds <= 0.0 || dtSeconds > kMaxReasonableDtSeconds;
+
+    if (invalidDt || mediumScale < this->added_mass_reset_scale_threshold_ ||
+        this->reset_added_mass_estimator_ ||
+        !this->added_mass_estimator_initialized_) {
+      this->ResetAddedMassEstimator(state);
+    } else {
+      const auto filteredVelocity =
+          FirstOrderLpf(state, this->filtered_relative_velocity_, dtSeconds,
+                        this->added_mass_velocity_filter_tau_);
+
+      Vec6 rawAcceleration{};
+      for (std::size_t i = 0; i < kStateSize; ++i) {
+        rawAcceleration[i] =
+            (filteredVelocity[i] - this->filtered_relative_velocity_[i]) /
+            dtSeconds;
+      }
+
+      const auto filteredAcceleration =
+          FirstOrderLpf(rawAcceleration, this->filtered_relative_acceleration_,
+                        dtSeconds, this->added_mass_accel_filter_tau_);
+      auto limitedAcceleration = LimitAccelerationAmplitude(
+          filteredAcceleration, this->added_mass_linear_accel_limit_,
+          this->added_mass_angular_accel_limit_);
+      limitedAcceleration =
+          LimitAccelerationJerk(limitedAcceleration,
+                                this->limited_relative_acceleration_,
+                                dtSeconds, this->added_mass_linear_jerk_limit_,
+                                this->added_mass_angular_jerk_limit_);
+
+      this->filtered_relative_velocity_ = filteredVelocity;
+      this->filtered_relative_acceleration_ = filteredAcceleration;
+      this->limited_relative_acceleration_ = limitedAcceleration;
+
+      if (this->enable_added_mass_) {
+        totalForce += gz::math::Vector3d(
+            -this->added_mass_diagonal_[0] * limitedAcceleration[0],
+            -this->added_mass_diagonal_[1] * limitedAcceleration[1],
+            -this->added_mass_diagonal_[2] * limitedAcceleration[2]);
+        totalTorque += gz::math::Vector3d(
+            -this->added_mass_diagonal_[3] * limitedAcceleration[3],
+            -this->added_mass_diagonal_[4] * limitedAcceleration[4],
+            -this->added_mass_diagonal_[5] * limitedAcceleration[5]);
+      }
+
+      if (this->enable_added_mass_coriolis_) {
+        const gz::math::Vector3d nu1(state[0], state[1], state[2]);
+        const gz::math::Vector3d nu2(state[3], state[4], state[5]);
+        const gz::math::Vector3d a11nu1(
+            this->added_mass_diagonal_[0] * state[0],
+            this->added_mass_diagonal_[1] * state[1],
+            this->added_mass_diagonal_[2] * state[2]);
+        const gz::math::Vector3d a22nu2(
+            this->added_mass_diagonal_[3] * state[3],
+            this->added_mass_diagonal_[4] * state[4],
+            this->added_mass_diagonal_[5] * state[5]);
+
+        totalForce += -Cross(a11nu1, nu2);
+        totalTorque += -Cross(a11nu1, nu1) - Cross(a22nu2, nu2);
+      }
+    }
+  }
 
   totalForce *= mediumScale;
   totalTorque *= mediumScale;
@@ -539,6 +752,15 @@ void HydrodynamicsPlugin::PublishTransitionState(
 
   msg.add_data(_airClearanceOk ? 1.0f : 0.0f);
   this->transition_publisher_.Publish(msg);
+}
+
+void HydrodynamicsPlugin::ResetAddedMassEstimator(
+    const std::array<double, 6> &_state) {
+  this->filtered_relative_velocity_ = _state;
+  this->filtered_relative_acceleration_.fill(0.0);
+  this->limited_relative_acceleration_.fill(0.0);
+  this->added_mass_estimator_initialized_ = true;
+  this->reset_added_mass_estimator_ = false;
 }
 
 }  // namespace hydrodynamics
