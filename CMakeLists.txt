@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(hippo_gz_plugins)
+project(zyshine3_gz_plugins)
 set(lib_name hydrodynamics)
 # 查找所需的 Gazebo 相关依赖
 find_package(gz-plugin2 REQUIRED COMPONENTS register)

@@ -10,6 +10,7 @@ institution: TeleAI,Chinatelecom,Shanghai
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -228,6 +229,7 @@ void HydrodynamicsPlugin::PreUpdate(const gz::sim::UpdateInfo &_info,
     return;
   }
 
+  this->RecheckAddedMassOwnershipIfPending(_ecm);
   this->UpdateForcesAndMoments(_info, _ecm);
 }
 
@@ -264,6 +266,7 @@ void HydrodynamicsPlugin::ParseHydrodynamics(
   this->filtered_relative_velocity_.fill(0.0);
   this->filtered_relative_acceleration_.fill(0.0);
   this->limited_relative_acceleration_.fill(0.0);
+  this->pending_added_mass_ownership_recheck_ = false;
 
   std::string linkName;
   if (_element->HasElement("link_name")) {
@@ -426,21 +429,12 @@ void HydrodynamicsPlugin::AddRequiredComponents(
 void HydrodynamicsPlugin::DetectAddedMassOwnership(
     gz::sim::EntityComponentManager &_ecm) {
   const auto linkName = LinkNameOrEntity(this->link_, _ecm);
-  const auto worldFluidAddedMass = this->link_.WorldFluidAddedMassMatrix(_ecm);
-  auto inertial = _ecm.Component<gz::sim::components::Inertial>(
-      this->link_entity_);
-  const bool hasWorldFluidAddedMass =
-      worldFluidAddedMass.has_value() &&
-      HasNonZeroFluidAddedMass(worldFluidAddedMass.value());
-  const bool hasLocalFluidAddedMass =
-      inertial != nullptr && inertial->Data().FluidAddedMass().has_value() &&
-      HasNonZeroFluidAddedMass(inertial->Data().FluidAddedMass().value());
-  const bool pluginAddedMassConfigured =
-      HasNonZeroAddedMassDiagonal(this->added_mass_diagonal_) &&
-      (this->enable_added_mass_ || this->enable_added_mass_coriolis_);
+  const bool engineOwnsAddedMass = this->HasEngineOwnedAddedMass(_ecm);
+  const bool pluginAddedMassConfigured = this->HasPluginAddedMassConfigured();
 
-  if (hasWorldFluidAddedMass || hasLocalFluidAddedMass) {
+  if (engineOwnsAddedMass) {
     this->engine_owns_added_mass_ = true;
+    this->pending_added_mass_ownership_recheck_ = false;
     if (pluginAddedMassConfigured) {
       gzwarn << "[HybridHydrodynamics] Detected non-zero <fluid_added_mass> "
                 "on link ["
@@ -461,6 +455,9 @@ void HydrodynamicsPlugin::DetectAddedMassOwnership(
   }
 
   this->engine_owns_added_mass_ = false;
+  // If configure-time inspection cannot settle ownership yet, allow one
+  // bounded runtime confirmation pass from PreUpdate() before steady stepping.
+  this->pending_added_mass_ownership_recheck_ = pluginAddedMassConfigured;
   if (pluginAddedMassConfigured) {
     gzmsg << "[HybridHydrodynamics] Plugin-side added mass is active on link ["
           << linkName << "] with inertia_term="
@@ -473,6 +470,26 @@ void HydrodynamicsPlugin::DetectAddedMassOwnership(
              "hydrodynamics on link ["
           << linkName << "]." << std::endl;
   }
+}
+
+void HydrodynamicsPlugin::RecheckAddedMassOwnershipIfPending(
+    gz::sim::EntityComponentManager &_ecm) {
+  if (!this->pending_added_mass_ownership_recheck_) {
+    return;
+  }
+
+  this->pending_added_mass_ownership_recheck_ = false;
+  if (!this->HasEngineOwnedAddedMass(_ecm)) {
+    return;
+  }
+
+  this->engine_owns_added_mass_ = true;
+  gzwarn << "[HybridHydrodynamics] Runtime fallback re-check detected "
+            "non-zero <fluid_added_mass> on link ["
+         << LinkNameOrEntity(this->link_, _ecm)
+         << "]. Plugin-side -M_A * nu_dot_r and C_A(nu_r)nu_r are disabled "
+            "to avoid double counting."
+         << std::endl;
 }
 
 void HydrodynamicsPlugin::WarnOnDeprecatedParameters(
@@ -524,7 +541,10 @@ void HydrodynamicsPlugin::UpdateForcesAndMoments(
   const auto worldAngular =
       this->link_.WorldAngularVelocity(_ecm).value_or(gz::math::Vector3d::Zero);
 
-  if (!pose.has_value() || worldLinear == nullptr) {
+  if (!this->HasRequiredWorldState(pose, worldLinear)) {
+    // Missing pose or linear velocity marks the estimator stale so the next
+    // valid step restarts cleanly instead of carrying forward old state.
+    this->reset_added_mass_estimator_ = true;
     return;
   }
 
@@ -565,7 +585,7 @@ void HydrodynamicsPlugin::UpdateForcesAndMoments(
   const double mediumScale =
       std::clamp(hullRatio * densityScale, 0.0, 1.0);
 
-  if (mediumScale < 1e-5) {
+  if (this->IsMediumScaleBelowHardCutoff(mediumScale)) {
     this->reset_added_mass_estimator_ = true;
     return;
   }
@@ -589,20 +609,22 @@ void HydrodynamicsPlugin::UpdateForcesAndMoments(
   gz::math::Vector3d totalTorque(-dampingWrench[3], -dampingWrench[4],
                                  -dampingWrench[5]);
 
-  const bool pluginAddedMassEnabled =
-      !this->engine_owns_added_mass_ &&
-      HasNonZeroAddedMassDiagonal(this->added_mass_diagonal_) &&
-      (this->enable_added_mass_ || this->enable_added_mass_coriolis_);
+  const bool pluginAddedMassAllowed = this->IsPluginAddedMassAllowed();
+  const bool shouldResetAddedMassEstimator =
+      pluginAddedMassAllowed &&
+      this->ShouldResetAddedMassEstimator(_info, mediumScale);
+  const bool pluginAddedMassDynamicsAllowed =
+      pluginAddedMassAllowed && !shouldResetAddedMassEstimator;
+  const bool inertiaTermAllowed =
+      this->IsInertiaTermAllowed(pluginAddedMassDynamicsAllowed);
+  const bool couplingTermAllowed =
+      this->IsCouplingTermAllowed(pluginAddedMassAllowed);
 
-  if (pluginAddedMassEnabled) {
+  if (pluginAddedMassAllowed) {
     const double dtSeconds =
         static_cast<double>(_info.dt.count()) / 1'000'000'000.0;
-    const bool invalidDt =
-        dtSeconds <= 0.0 || dtSeconds > kMaxReasonableDtSeconds;
 
-    if (invalidDt || mediumScale < this->added_mass_reset_scale_threshold_ ||
-        this->reset_added_mass_estimator_ ||
-        !this->added_mass_estimator_initialized_) {
+    if (shouldResetAddedMassEstimator) {
       this->ResetAddedMassEstimator(state);
     } else {
       const auto filteredVelocity =
@@ -632,7 +654,7 @@ void HydrodynamicsPlugin::UpdateForcesAndMoments(
       this->filtered_relative_acceleration_ = filteredAcceleration;
       this->limited_relative_acceleration_ = limitedAcceleration;
 
-      if (this->enable_added_mass_) {
+      if (inertiaTermAllowed) {
         totalForce += gz::math::Vector3d(
             -this->added_mass_diagonal_[0] * limitedAcceleration[0],
             -this->added_mass_diagonal_[1] * limitedAcceleration[1],
@@ -642,22 +664,24 @@ void HydrodynamicsPlugin::UpdateForcesAndMoments(
             -this->added_mass_diagonal_[4] * limitedAcceleration[4],
             -this->added_mass_diagonal_[5] * limitedAcceleration[5]);
       }
+    }
 
-      if (this->enable_added_mass_coriolis_) {
-        const gz::math::Vector3d nu1(state[0], state[1], state[2]);
-        const gz::math::Vector3d nu2(state[3], state[4], state[5]);
-        const gz::math::Vector3d a11nu1(
-            this->added_mass_diagonal_[0] * state[0],
-            this->added_mass_diagonal_[1] * state[1],
-            this->added_mass_diagonal_[2] * state[2]);
-        const gz::math::Vector3d a22nu2(
-            this->added_mass_diagonal_[3] * state[3],
-            this->added_mass_diagonal_[4] * state[4],
-            this->added_mass_diagonal_[5] * state[5]);
+    // Coupling uses the current-state gate only; it is not blocked by an
+    // estimator reset once ownership/config gates allow plugin-side added mass.
+    if (couplingTermAllowed) {
+      const gz::math::Vector3d nu1(state[0], state[1], state[2]);
+      const gz::math::Vector3d nu2(state[3], state[4], state[5]);
+      const gz::math::Vector3d a11nu1(
+          this->added_mass_diagonal_[0] * state[0],
+          this->added_mass_diagonal_[1] * state[1],
+          this->added_mass_diagonal_[2] * state[2]);
+      const gz::math::Vector3d a22nu2(
+          this->added_mass_diagonal_[3] * state[3],
+          this->added_mass_diagonal_[4] * state[4],
+          this->added_mass_diagonal_[5] * state[5]);
 
-        totalForce += -Cross(a11nu1, nu2);
-        totalTorque += -Cross(a11nu1, nu1) - Cross(a22nu2, nu2);
-      }
+      totalForce += -Cross(a11nu1, nu2);
+      totalTorque += -Cross(a11nu1, nu1) - Cross(a22nu2, nu2);
     }
   }
 
@@ -666,6 +690,62 @@ void HydrodynamicsPlugin::UpdateForcesAndMoments(
 
   this->link_.AddWorldWrench(_ecm, pose->Rot() * totalForce,
                              pose->Rot() * totalTorque);
+}
+
+bool HydrodynamicsPlugin::HasRequiredWorldState(
+    const std::optional<gz::math::Pose3d> &_pose,
+    const gz::sim::components::WorldLinearVelocity *_worldLinear) const {
+  return _pose.has_value() && _worldLinear != nullptr;
+}
+
+bool HydrodynamicsPlugin::HasEngineOwnedAddedMass(
+    gz::sim::EntityComponentManager &_ecm) const {
+  const auto worldFluidAddedMass = this->link_.WorldFluidAddedMassMatrix(_ecm);
+  auto inertial =
+      _ecm.Component<gz::sim::components::Inertial>(this->link_entity_);
+  const bool hasWorldFluidAddedMass =
+      worldFluidAddedMass.has_value() &&
+      HasNonZeroFluidAddedMass(worldFluidAddedMass.value());
+  const bool hasLocalFluidAddedMass =
+      inertial != nullptr && inertial->Data().FluidAddedMass().has_value() &&
+      HasNonZeroFluidAddedMass(inertial->Data().FluidAddedMass().value());
+  return hasWorldFluidAddedMass || hasLocalFluidAddedMass;
+}
+
+bool HydrodynamicsPlugin::HasPluginAddedMassConfigured() const {
+  return HasNonZeroAddedMassDiagonal(this->added_mass_diagonal_) &&
+         (this->enable_added_mass_ || this->enable_added_mass_coriolis_);
+}
+
+bool HydrodynamicsPlugin::IsMediumScaleBelowHardCutoff(
+    const double _mediumScale) const {
+  return _mediumScale < 1e-5;
+}
+
+bool HydrodynamicsPlugin::IsPluginAddedMassAllowed() const {
+  return !this->engine_owns_added_mass_ &&
+         this->HasPluginAddedMassConfigured();
+}
+
+bool HydrodynamicsPlugin::ShouldResetAddedMassEstimator(
+    const gz::sim::UpdateInfo &_info, const double _mediumScale) const {
+  const double dtSeconds = static_cast<double>(_info.dt.count()) / 1'000'000'000.0;
+  const bool invalidDt =
+      dtSeconds <= 0.0 || dtSeconds > kMaxReasonableDtSeconds;
+  return invalidDt ||
+         _mediumScale < this->added_mass_reset_scale_threshold_ ||
+         this->reset_added_mass_estimator_ ||
+         !this->added_mass_estimator_initialized_;
+}
+
+bool HydrodynamicsPlugin::IsInertiaTermAllowed(
+    const bool _pluginAddedMassDynamicsAllowed) const {
+  return _pluginAddedMassDynamicsAllowed && this->enable_added_mass_;
+}
+
+bool HydrodynamicsPlugin::IsCouplingTermAllowed(
+    const bool _pluginAddedMassAllowed) const {
+  return _pluginAddedMassAllowed && this->enable_added_mass_coriolis_;
 }
 
 double HydrodynamicsPlugin::SampleSubmergence(double _worldZ) const {

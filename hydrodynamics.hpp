@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,9 +36,23 @@ class HydrodynamicsPlugin : public gz::sim::System,
                           const gz::sim::EntityComponentManager &_ecm);
   void AddRequiredComponents(gz::sim::EntityComponentManager &_ecm);
   void DetectAddedMassOwnership(gz::sim::EntityComponentManager &_ecm);
+  void RecheckAddedMassOwnershipIfPending(
+      gz::sim::EntityComponentManager &_ecm);
   void WarnOnDeprecatedParameters(const sdf::ElementPtr _element) const;
   void UpdateForcesAndMoments(const gz::sim::UpdateInfo &_info,
                               gz::sim::EntityComponentManager &_ecm);
+  bool HasEngineOwnedAddedMass(
+      gz::sim::EntityComponentManager &_ecm) const;
+  bool HasPluginAddedMassConfigured() const;
+  bool HasRequiredWorldState(
+      const std::optional<gz::math::Pose3d> &_pose,
+      const gz::sim::components::WorldLinearVelocity *_worldLinear) const;
+  bool IsMediumScaleBelowHardCutoff(double _mediumScale) const;
+  bool IsPluginAddedMassAllowed() const;
+  bool ShouldResetAddedMassEstimator(const gz::sim::UpdateInfo &_info,
+                                     double _mediumScale) const;
+  bool IsInertiaTermAllowed(bool _pluginAddedMassDynamicsAllowed) const;
+  bool IsCouplingTermAllowed(bool _pluginAddedMassAllowed) const;
 
   double SampleSubmergence(double _worldZ) const;
   double ComputeLinkSubmergence(
@@ -89,6 +104,7 @@ class HydrodynamicsPlugin : public gz::sim::System,
   bool reset_added_mass_estimator_{true};
 
   bool engine_owns_added_mass_{false};
+  bool pending_added_mass_ownership_recheck_{false};
 
   gz::transport::Node node_;
   gz::transport::Node::Publisher transition_publisher_;
