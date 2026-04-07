@@ -7,6 +7,7 @@
 
 #include <gz/math.hh>
 #include <gz/msgs/float_v.pb.h>
+#include <gz/sim/components/LinearVelocity.hh>
 #include <gz/sim/Link.hh>
 #include <gz/sim/Model.hh>
 #include <gz/sim/System.hh>
